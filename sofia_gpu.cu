@@ -28,12 +28,12 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <curand_kernel.h>
-#include <device_functions.h>
+#include <device_launch_parameters.h>
 
 #define CONST_WORD_LIMIT 10
 #define CONST_CHARSET_LIMIT 100
 
-#define CONST_CHARSET "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+constexpr char CONST_CHARSET[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; //brute-force alphabet
 #define CONST_CHARSET_LENGTH (sizeof(CONST_CHARSET) - 1)
 
 #define CONST_WORD_LENGTH_MIN 1
@@ -46,6 +46,8 @@
 #include "assert.cu"
 #include "md5.cu"
 
+constexpr char CONST_SOFIA_CHARSET[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; //sofia alphabet, 62 meaning chars, DO NOT EDIT!
+
 /* Global variables */
 uint8_t g_wordLength;
 
@@ -53,8 +55,10 @@ char g_word[CONST_WORD_LIMIT];
 char g_charset[CONST_CHARSET_LIMIT];
 char g_cracked[CONST_WORD_LIMIT];
 
-__device__ char g_deviceCharset[CONST_CHARSET_LIMIT];
+__device__ __constant__ char g_deviceCharset[CONST_CHARSET_LIMIT];
+__device__ __constant__ char g_deviceSofiaCharset[62];
 __device__ char g_deviceCracked[CONST_WORD_LIMIT];
+
 
 __device__ __host__ bool next(uint8_t* length, char* word, uint32_t increment){
   uint32_t idx = 0;
@@ -82,11 +86,12 @@ __device__ __host__ bool next(uint8_t* length, char* word, uint32_t increment){
   return true;
 }
 
-__global__ void md5Crack(uint8_t wordLength, char* charsetWord, uint32_t hash01, uint32_t hash02, uint32_t hash03, uint32_t hash04){
+__device__ inline uint16_t calcSofia(uint32_t word32) {
+    return (g_deviceSofiaCharset[(((word32 & 0xFF000000) >> 24) + ((word32 & 0x00FF0000) >> 16)) % 62] << 8) + (g_deviceSofiaCharset[(((word32 & 0x0000FF00) >> 8) + (word32 & 0x000000FF)) % 62]);
+}
+
+__global__ void sofiaCrack(uint8_t wordLength, char* charsetWord, uint32_t sofiaHash_target1part, uint32_t sofiaHash_target2part){
   uint32_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * HASHES_PER_KERNEL;
-  
-  /* Shared variables */
-  __shared__ char sharedCharset[CONST_CHARSET_LIMIT];
   
   /* Thread variables */
   char threadCharsetWord[CONST_WORD_LIMIT];
@@ -94,22 +99,32 @@ __global__ void md5Crack(uint8_t wordLength, char* charsetWord, uint32_t hash01,
   uint8_t threadWordLength;
   uint32_t threadHash01, threadHash02, threadHash03, threadHash04;
   
+  uint32_t sofiaHash1part, sofiaHash2part;
+  uint16_t *sofiaHash16;
+
   /* Copy everything to local memory */
   memcpy(threadCharsetWord, charsetWord, CONST_WORD_LIMIT);
   memcpy(&threadWordLength, &wordLength, sizeof(uint8_t));
-  memcpy(sharedCharset, g_deviceCharset, sizeof(uint8_t) * CONST_CHARSET_LIMIT);
   
   /* Increment current word by thread index */
   next(&threadWordLength, threadCharsetWord, idx);
   
   for(uint32_t hash = 0; hash < HASHES_PER_KERNEL; hash++){
     for(uint32_t i = 0; i < threadWordLength; i++){
-      threadTextWord[i] = sharedCharset[threadCharsetWord[i]];
+      threadTextWord[i] = g_deviceCharset[threadCharsetWord[i]];
     }
     
-    md5Hash((unsigned char*)threadTextWord, threadWordLength, &threadHash01, &threadHash02, &threadHash03, &threadHash04);   
+    md5Hash((unsigned char*)threadTextWord, threadWordLength, &threadHash01, &threadHash02, &threadHash03, &threadHash04);
 
-    if(threadHash01 == hash01 && threadHash02 == hash02 && threadHash03 == hash03 && threadHash04 == hash04){
+    sofiaHash16 = (uint16_t *)&sofiaHash1part;
+    *sofiaHash16 = calcSofia(threadHash01);
+    *(sofiaHash16 + 1) = calcSofia(threadHash02);
+
+    sofiaHash16 = (uint16_t *)&sofiaHash2part;
+    *sofiaHash16 = calcSofia(threadHash03);
+    *(sofiaHash16 + 1) = calcSofia(threadHash04);
+    
+    if(sofiaHash_target1part == sofiaHash1part && sofiaHash_target2part == sofiaHash2part){ //check
       memcpy(g_deviceCracked, threadTextWord, threadWordLength);
     }
     
@@ -121,8 +136,8 @@ __global__ void md5Crack(uint8_t wordLength, char* charsetWord, uint32_t hash01,
 
 int main(int argc, char* argv[]){
   /* Check arguments */
-  if(argc != 2 || strlen(argv[1]) != 32){
-    std::cout << argv[0] << " <md5_hash>" << std::endl;
+  if(argc != 2 || strlen(argv[1]) != 8){
+    std::cout << argv[0] << " <sofia_hash>" << std::endl;
     return -1;
   }
   
@@ -137,17 +152,12 @@ int main(int argc, char* argv[]){
   std::cout << "Notice: " << devices << " device(s) found" << std::endl;
   
   /* Hash stored as u32 integers */
-  uint32_t md5Hash[4];
+  uint32_t sofiaHash1part, sofiaHash2part;
   
   /* Parse argument */
-  for(uint8_t i = 0; i < 4; i++){
-    char tmp[16];
-    
-    strncpy(tmp, argv[1] + i * 8, 8);
-    sscanf(tmp, "%x", &md5Hash[i]);   
-    md5Hash[i] = (md5Hash[i] & 0xFF000000) >> 24 | (md5Hash[i] & 0x00FF0000) >> 8 | (md5Hash[i] & 0x0000FF00) << 8 | (md5Hash[i] & 0x000000FF) << 24;
-  }
-  
+  memcpy(&sofiaHash1part, argv[1], 4);
+  memcpy(&sofiaHash2part, argv[1] + 4, 4);
+
   /* Fill memory */
   memset(g_word, 0, CONST_WORD_LIMIT);
   memset(g_cracked, 0, CONST_WORD_LIMIT);
@@ -162,11 +172,17 @@ int main(int argc, char* argv[]){
   /* Time */
   cudaEvent_t clockBegin;
   cudaEvent_t clockLast;
+  cudaEvent_t clockSprintBegin;
+  cudaEvent_t clockSprintLast;
   
   cudaEventCreate(&clockBegin);
   cudaEventCreate(&clockLast);
+  cudaEventCreate(&clockSprintBegin);
+  cudaEventCreate(&clockSprintLast);
   cudaEventRecord(clockBegin, 0);
   
+  float milliseconds = 0;
+
   /* Current word is different on each device */
   char** words = new char*[devices];
   
@@ -175,6 +191,7 @@ int main(int argc, char* argv[]){
     
     /* Copy to each device */
     ERROR_CHECK(cudaMemcpyToSymbol(g_deviceCharset, g_charset, sizeof(uint8_t) * CONST_CHARSET_LIMIT, 0, cudaMemcpyHostToDevice));
+    ERROR_CHECK(cudaMemcpyToSymbol(g_deviceSofiaCharset, CONST_SOFIA_CHARSET, sizeof(uint8_t) * 62, 0, cudaMemcpyHostToDevice));
     ERROR_CHECK(cudaMemcpyToSymbol(g_deviceCracked, g_cracked, sizeof(uint8_t) * CONST_WORD_LIMIT, 0, cudaMemcpyHostToDevice));
     
     /* Allocate on each device */
@@ -185,6 +202,7 @@ int main(int argc, char* argv[]){
     bool result = false;
     bool found = false;
     
+    cudaEventRecord(clockSprintBegin, 0);
     for(int device = 0; device < devices; device++){
       cudaSetDevice(device);
       
@@ -192,20 +210,24 @@ int main(int argc, char* argv[]){
       ERROR_CHECK(cudaMemcpy(words[device], g_word, sizeof(uint8_t) * CONST_WORD_LIMIT, cudaMemcpyHostToDevice)); 
     
       /* Start kernel */
-      md5Crack<<<TOTAL_BLOCKS, TOTAL_THREADS>>>(g_wordLength, words[device], md5Hash[0], md5Hash[1], md5Hash[2], md5Hash[3]);
+      sofiaCrack<<<TOTAL_BLOCKS, TOTAL_THREADS>>>(g_wordLength, words[device], sofiaHash1part, sofiaHash2part);
       
       /* Global increment */
       result = next(&g_wordLength, g_word, TOTAL_THREADS * HASHES_PER_KERNEL * TOTAL_BLOCKS);
     }
-    
+    cudaEventRecord(clockSprintLast, 0);
+
     /* Display progress */
     char word[CONST_WORD_LIMIT];
     
     for(int i = 0; i < g_wordLength; i++){
       word[i] = g_charset[g_word[i]];
     }
+
+    cudaEventSynchronize(clockSprintLast);
+    cudaEventElapsedTime(&milliseconds, clockSprintBegin, clockSprintLast);
     
-    std::cout << "Notice: currently at " << std::string(word, g_wordLength) << " (" << (uint32_t)g_wordLength << ")" << std::endl;
+    std::cout << "Notice: currently at " << std::string(word, g_wordLength) << " (" << (uint32_t)g_wordLength << "); sprint duration: " << milliseconds << " ms; speed: " << (TOTAL_THREADS * HASHES_PER_KERNEL * TOTAL_BLOCKS) / milliseconds << " hash/ms" << std::endl;
     
     for(int device = 0; device < devices; device++){
       cudaSetDevice(device);
@@ -218,7 +240,7 @@ int main(int argc, char* argv[]){
       
       /* Check result */
       if(found = *g_cracked != 0){     
-        std::cout << "Notice: cracked " << g_cracked << std::endl; 
+        std::cout << "Notice: cracked |" << g_cracked << '|' << std::endl;
         break;
       }
     }
@@ -245,14 +267,14 @@ int main(int argc, char* argv[]){
   /* Main device */
   cudaSetDevice(0);
   
-  float milliseconds = 0;
-  
   cudaEventRecord(clockLast, 0);
   cudaEventSynchronize(clockLast);
   cudaEventElapsedTime(&milliseconds, clockBegin, clockLast);
   
-  std::cout << "Notice: computation time " << milliseconds << " ms" << std::endl;
+  std::cout << "Notice: computation time " << milliseconds / 1000 << " sec" << std::endl;
   
   cudaEventDestroy(clockBegin);
   cudaEventDestroy(clockLast);
+  cudaEventDestroy(clockSprintBegin);
+  cudaEventDestroy(clockSprintLast);
 }
